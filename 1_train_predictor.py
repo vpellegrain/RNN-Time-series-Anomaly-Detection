@@ -3,11 +3,12 @@ import time
 import torch
 import torch.nn as nn
 import preprocess_data
-from model import model
+from model import TimeSeriesLSTMStochastic
 from torch import optim
 from matplotlib import pyplot as plt
 from pathlib import Path
 from anomalyDetector import fit_norm_distribution_param
+from dataloading import TimeSeriesDataset
 
 parser = argparse.ArgumentParser(description='PyTorch RNN Prediction Model on Time-series Dataset')
 parser.add_argument('--data', type=str, default='ecg',
@@ -69,31 +70,7 @@ args = parser.parse_args()
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
 
-###############################################################################
-# Load data
-###############################################################################
-TimeseriesData = preprocess_data.PickleDataLoad(data_type=args.data, filename=args.filename,
-                                                augment_test_data=args.augment)
-train_dataset = TimeseriesData.batchify(args,TimeseriesData.trainData, args.batch_size)
-test_dataset = TimeseriesData.batchify(args,TimeseriesData.testData, args.eval_batch_size)
-gen_dataset = TimeseriesData.batchify(args,TimeseriesData.testData, 1)
 
-
-###############################################################################
-# Build the model
-###############################################################################
-feature_dim = TimeseriesData.trainData.size(1)
-model = model.RNNPredictor(rnn_type = args.model,
-                           enc_inp_size=feature_dim,
-                           rnn_inp_size = args.emsize,
-                           rnn_hid_size = args.nhid,
-                           dec_out_size=feature_dim,
-                           nlayers = args.nlayers,
-                           dropout = args.dropout,
-                           tie_weights= args.tied,
-                           res_connection=args.res_connection).to(args.device)
-optimizer = optim.Adam(model.parameters(), lr= args.lr,weight_decay=args.weight_decay)
-criterion = nn.MSELoss()
 ###############################################################################
 # Training code
 ###############################################################################
@@ -196,104 +173,130 @@ def evaluate_1step_pred(args, model, test_dataset):
 
     return total_loss / nbatch
 
-def train(args, model, train_dataset,epoch):
-
+def train(model, dataset, epoch):
+    epoch_loss1=[]
+    epoch_loss2=[]
+    epoch_loss3=[]
+    total_1 = 0
+    total_2 = 0
+    total_3 = 0
     with torch.enable_grad():
         # Turn on training mode which enables dropout.
         model.train()
         total_loss = 0
-        start_time = time.time()
-        hidden = model.init_hidden(args.batch_size)
-        for batch, i in enumerate(range(0, train_dataset.size(0) - 1, args.bptt)):
-            inputSeq, targetSeq = get_batch(args,train_dataset, i)
-            # inputSeq: [ seq_len * batch_size * feature_size ]
-            # targetSeq: [ seq_len * batch_size * feature_size ]
-
-            # Starting each batch, we detach the hidden state from how it was previously produced.
-            # If we didn't, the model would try backpropagating all the way to start of the dataset.
-            hidden = model.repackage_hidden(hidden)
-            hidden_ = model.repackage_hidden(hidden)
-            optimizer.zero_grad()
-
-            '''Loss1: Free running loss'''
-            outVal = inputSeq[0].unsqueeze(0)
-            outVals=[]
-            hids1 = []
-            for i in range(inputSeq.size(0)):
-                outVal, hidden_, hid = model.forward(outVal, hidden_,return_hiddens=True)
-                outVals.append(outVal)
-                hids1.append(hid)
-            outSeq1 = torch.cat(outVals,dim=0)
-            hids1 = torch.cat(hids1,dim=0)
-            loss1 = criterion(outSeq1.view(args.batch_size,-1), targetSeq.view(args.batch_size,-1))
-
-            '''Loss2: Teacher forcing loss'''
-            outSeq2, hidden, hids2 = model.forward(inputSeq, hidden, return_hiddens=True)
-            loss2 = criterion(outSeq2.view(args.batch_size, -1), targetSeq.view(args.batch_size, -1))
-
-            '''Loss3: Simplified Professor forcing loss'''
-            loss3 = criterion(hids1.view(args.batch_size,-1), hids2.view(args.batch_size,-1).detach())
-
-            '''Total loss = Loss1+Loss2+Loss3'''
-            loss = loss1+loss2+loss3
-            loss.backward()
-
-            # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-            optimizer.step()
-
-            total_loss += loss.item()
-
-            if batch % args.log_interval == 0 and batch > 0:
-                cur_loss = total_loss / args.log_interval
-                elapsed = time.time() - start_time
-                print('| epoch {:3d} | {:5d}/{:5d} batches | ms/batch {:5.4f} | '
-                      'loss {:5.2f} '.format(
-                    epoch, batch, len(train_dataset) // args.bptt,
-                                  elapsed * 1000 / args.log_interval, cur_loss))
-                total_loss = 0
-                start_time = time.time()
+        for e in range(epoch):
+            epoch_loss = []
+            for i, (x, y, idx) in enumerate(dataset):
+                epoch_loss1.append(0)
+                epoch_loss2.append(0)
+                epoch_loss3.append(0)
+                epoch_loss.append(0)
+                hidden = model.init_hidden()
+                hidden_ = model.init_hidden()
+                optimizer.zero_grad()
+                outVal = x[0]
+                outVals=[]
+                hids1 = []
+                for _ in range(x.size(0)):
+                    outVal, hidden_, hid = model(outVal.unsqueeze(0), hidden_,return_hiddens=True)
+                    outVals.append(outVal)
+                    hids1.append(hid)
+                hids1 = torch.cat(hids1, dim=0)
+                outSeq1 = torch.cat(outVals,dim=0)
+                loss1 = criterion(outSeq1, y.view(-1))
+                total_1 += loss1.item()
+                epoch_loss1[-1]+=loss1.item()
+                
+                outSeq2, hidden, hids2 = model(x, hidden, return_hiddens=True)
+                loss2 = criterion(outSeq2, y)
+                total_2 += loss2.item()
+                epoch_loss2[-1]+=loss2.item()
+                
+                loss3 = criterion(hids1.detach(), hids2.detach())
+                total_3 += loss3.item()
+                epoch_loss3[-1]+=loss3.item()
+                
+                loss = loss1+loss2+loss3
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
+                optimizer.step()
+                total_loss += loss.item()
+                epoch_loss[-1] += loss.item()
+                if i % 10 == 0 and i > 0:
+                    print(i, total_loss / 10, total_1/10, total_2 /10, total_3/10)
+                    total_loss = 0
+                    total_1 = 0
+                    total_2 = 0
+                    total_3 = 0
+                #except:
+                 #   print(idx, x_len)
+            epoch_loss[-1]/=len(dataset)
+            epoch_loss1[-1]/=len(dataset)
+            epoch_loss2[-1]/=len(dataset)
+            epoch_loss3[-1]/=len(dataset)
+            print("EPOCH {:3d} : loss = {:5.4f} ,loss1 = {:5.4f} , loss2 = {:5.4f} , loss3 = {:5.4f} ".format(e, epoch_loss[-1], epoch_loss1[-1], epoch_loss2[-1], epoch_loss3[-1]))
+    return epoch_loss,epoch_loss1,epoch_loss2,epoch_loss3
 
 def evaluate(args, model, test_dataset):
     # Turn on evaluation mode which disables dropout.
     model.eval()
     with torch.no_grad():
         total_loss = 0
-        hidden = model.init_hidden(args.eval_batch_size)
-        nbatch = 1
-        for nbatch, i in enumerate(range(0, test_dataset.size(0) - 1, args.bptt)):
-            inputSeq, targetSeq = get_batch(args,test_dataset, i)
-            # inputSeq: [ seq_len * batch_size * feature_size ]
-            # targetSeq: [ seq_len * batch_size * feature_size ]
-            hidden_ = model.repackage_hidden(hidden)
-            '''Loss1: Free running loss'''
-            outVal = inputSeq[0].unsqueeze(0)
-            outVals=[]
-            hids1 = []
-            for i in range(inputSeq.size(0)):
-                outVal, hidden_, hid = model.forward(outVal, hidden_,return_hiddens=True)
-                outVals.append(outVal)
-                hids1.append(hid)
-            outSeq1 = torch.cat(outVals,dim=0)
-            hids1 = torch.cat(hids1,dim=0)
-            loss1 = criterion(outSeq1.view(args.batch_size,-1), targetSeq.view(args.batch_size,-1))
+        for t in range(len(test_dataset)):
+            hidden = model.init_hidden(args.eval_batch_size)
+            nbatch = 1
+            for nbatch, i in enumerate(range(0, test_dataset.size(0) - 1, args.bptt)):
+                inputSeq, targetSeq = get_batch(args,test_dataset, i)
+                # inputSeq: [ seq_len * batch_size * feature_size ]
+                # targetSeq: [ seq_len * batch_size * feature_size ]
+                hidden_ = model.repackage_hidden(hidden)
+                '''Loss1: Free running loss'''
+                outVal = inputSeq[0].unsqueeze(0)
+                outVals=[]
+                hids1 = []
+                for i in range(inputSeq.size(0)):
+                    outVal, hidden_, hid = model.forward(outVal, hidden_,return_hiddens=True)
+                    outVals.append(outVal)
+                    hids1.append(hid)
+                outSeq1 = torch.cat(outVals,dim=0)
+                hids1 = torch.cat(hids1,dim=0)
+                loss1 = criterion(outSeq1.view(args.batch_size,-1), targetSeq.view(args.batch_size,-1))
 
-            '''Loss2: Teacher forcing loss'''
-            outSeq2, hidden, hids2 = model.forward(inputSeq, hidden, return_hiddens=True)
-            loss2 = criterion(outSeq2.view(args.batch_size, -1), targetSeq.view(args.batch_size, -1))
+                '''Loss2: Teacher forcing loss'''
+                outSeq2, hidden, hids2 = model.forward(inputSeq, hidden, return_hiddens=True)
+                loss2 = criterion(outSeq2.view(args.batch_size, -1), targetSeq.view(args.batch_size, -1))
 
-            '''Loss3: Simplified Professor forcing loss'''
-            loss3 = criterion(hids1.view(args.batch_size,-1), hids2.view(args.batch_size,-1).detach())
+                '''Loss3: Simplified Professor forcing loss'''
+                loss3 = criterion(hids1.view(args.batch_size,-1), hids2.view(args.batch_size,-1).detach())
 
-            '''Total loss = Loss1+Loss2+Loss3'''
-            loss = loss1+loss2+loss3
+                '''Total loss = Loss1+Loss2+Loss3'''
+                loss = loss1+loss2+loss3
 
-            total_loss += loss.item()
+                total_loss += loss.item()
 
     return total_loss / (nbatch+1)
 
 
-# Loop over epochs.
+
+def main(args):
+    ###############################################################################
+    # Load data
+    ###############################################################################
+
+    train_dataset = TimeSeriesDataset(args.data, args.augment, args.noise_ratio)
+    test_dataset = TimeSeriesDataset(args.data, args.augment, args.noise_ratio, train = False, clean = False, trainset=train_dataset)
+    train_dataset_full = TimeSeriesDataset(args.data, args.augment, args.noise_ratio, train = True, clean = False, trainset=train_dataset)
+
+
+    ###############################################################################
+    # Build the model
+    ###############################################################################
+    feature_dim = train_dataset[0][0].shape[1]
+    model = TimeSeriesLSTMStochastic(feature_dim, args.embed_dim, args.hidden_dim, args.nb_layers, args.dropout).to(args.device)
+    optimizer = optim.Adam(model.parameters(), lr= args.lr,weight_decay=args.weight_decay)
+    criterion = nn.MSELoss()
+
+    # Loop over epochs.
 if args.resume or args.pretrained:
     print("=> loading checkpoint ")
     checkpoint = torch.load(Path('save', args.data, 'checkpoint', args.filename).with_suffix('.pth'))
@@ -314,28 +317,26 @@ print('-' * 89)
 if not args.pretrained:
     # At any point you can hit Ctrl + C to break out of training early.
     try:
-        for epoch in range(start_epoch, args.epochs+1):
 
-            epoch_start_time = time.time()
-            train(args,model,train_dataset,epoch)
-            val_loss = evaluate(args,model,test_dataset)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.4f} | '.format(epoch, (time.time() - epoch_start_time),                                                                                        val_loss))
-            print('-' * 89)
+        train(args,model,train_dataset,args.epochs)
+        val_loss = evaluate(args,model,test_dataset)
+        print('-' * 89)
+        print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.4f} | '.format(epoch, (time.time() - epoch_start_time),                                                                                        val_loss))
+        print('-' * 89)
 
-            generate_output(args,epoch,model,gen_dataset,startPoint=1500)
+        generate_output(args,epoch,model,gen_dataset,startPoint=1500)
 
-            if epoch%args.save_interval==0:
-                # Save the model if the validation loss is the best we've seen so far.
-                is_best = val_loss < best_val_loss
-                best_val_loss = min(val_loss, best_val_loss)
-                model_dictionary = {'epoch': epoch,
-                                    'best_loss': best_val_loss,
-                                    'state_dict': model.state_dict(),
-                                    'optimizer': optimizer.state_dict(),
-                                    'args':args
-                                    }
-                model.save_checkpoint(model_dictionary, is_best)
+        if epoch%args.save_interval==0:
+            # Save the model if the validation loss is the best we've seen so far.
+            is_best = val_loss < best_val_loss
+            best_val_loss = min(val_loss, best_val_loss)
+            model_dictionary = {'epoch': epoch,
+                                'best_loss': best_val_loss,
+                                'state_dict': model.state_dict(),
+                                'optimizer': optimizer.state_dict(),
+                                'args':args
+                                }
+            model.save_checkpoint(model_dictionary, is_best)
 
     except KeyboardInterrupt:
         print('-' * 89)
