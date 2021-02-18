@@ -3,7 +3,7 @@ import time
 import torch
 import torch.nn as nn
 import preprocess_data
-from model import TimeSeriesLSTMStochastic
+from model.model import TimeSeriesLSTMStochastic
 from torch import optim
 from matplotlib import pyplot as plt
 from pathlib import Path
@@ -11,19 +11,21 @@ from anomalyDetector import fit_norm_distribution_param
 from dataloading import TimeSeriesDataset
 
 parser = argparse.ArgumentParser(description='PyTorch RNN Prediction Model on Time-series Dataset')
-parser.add_argument('--data', type=str, default='ecg',
+parser.add_argument('--data', type=str, default='/mnt/d/vpell/Documents/Thèse/Python/data/3Tanks/capteurs_labels',
                     help='type of the dataset (ecg, gesture, power_demand, space_shuttle, respiration, nyc_taxi')
-parser.add_argument('--filename', type=str, default='chfdb_chf13_45590.pkl',
+parser.add_argument('--filename', type=str, default='5 epochs',
                     help='filename of the dataset')
 parser.add_argument('--model', type=str, default='LSTM',
                     help='type of recurrent net (RNN_TANH, RNN_RELU, LSTM, GRU, SRU)')
-parser.add_argument('--augment', type=bool, default=True,
+parser.add_argument('--augment', type=bool, default=False,
                     help='augment')
-parser.add_argument('--emsize', type=int, default=32,
+parser.add_argument('--noise_ratio', type=float, default=0.05,
+                    help='augment')                    
+parser.add_argument('--embed_dim', type=int, default=32,
                     help='size of rnn input features')
-parser.add_argument('--nhid', type=int, default=32,
+parser.add_argument('--hidden_dim', type=int, default=32,
                     help='number of hidden units per layer')
-parser.add_argument('--nlayers', type=int, default=2,
+parser.add_argument('--nb_layers', type=int, default=2,
                     help='number of layers')
 parser.add_argument('--res_connection', action='store_true',
                     help='residual connection')
@@ -33,7 +35,7 @@ parser.add_argument('--weight_decay', type=float, default=1e-4,
                     help='weight decay')
 parser.add_argument('--clip', type=float, default=10,
                     help='gradient clipping')
-parser.add_argument('--epochs', type=int, default=400,
+parser.add_argument('--epochs', type=int, default=5,
                     help='upper epoch limit')
 parser.add_argument('--batch_size', type=int, default=64, metavar='N',
                     help='batch size')
@@ -47,13 +49,13 @@ parser.add_argument('--dropout', type=float, default=0.2,
                     help='dropout applied to layers (0 = no dropout)')
 parser.add_argument('--tied', action='store_true',
                     help='tie the word embedding and softmax weights (deprecated)')
-parser.add_argument('--seed', type=int, default=1111,
+parser.add_argument('--seed', type=int, default=42,
                     help='random seed')
 parser.add_argument('--device', type=str, default='cuda',
                     help='cuda or cpu')
 parser.add_argument('--log_interval', type=int, default=10, metavar='N',
                     help='report interval')
-parser.add_argument('--save_interval', type=int, default=10, metavar='N',
+parser.add_argument('--save_interval', type=int, default=5, metavar='N',
                     help='save interval')
 parser.add_argument('--save_fig', action='store_true',
                     help='save figure')
@@ -242,61 +244,56 @@ def evaluate(args, model, test_dataset):
     model.eval()
     with torch.no_grad():
         total_loss = 0
-        for t in range(len(test_dataset)):
-            hidden = model.init_hidden(args.eval_batch_size)
-            nbatch = 1
-            for nbatch, i in enumerate(range(0, test_dataset.size(0) - 1, args.bptt)):
-                inputSeq, targetSeq = get_batch(args,test_dataset, i)
-                # inputSeq: [ seq_len * batch_size * feature_size ]
-                # targetSeq: [ seq_len * batch_size * feature_size ]
-                hidden_ = model.repackage_hidden(hidden)
-                '''Loss1: Free running loss'''
-                outVal = inputSeq[0].unsqueeze(0)
-                outVals=[]
-                hids1 = []
-                for i in range(inputSeq.size(0)):
-                    outVal, hidden_, hid = model.forward(outVal, hidden_,return_hiddens=True)
-                    outVals.append(outVal)
-                    hids1.append(hid)
-                outSeq1 = torch.cat(outVals,dim=0)
-                hids1 = torch.cat(hids1,dim=0)
-                loss1 = criterion(outSeq1.view(args.batch_size,-1), targetSeq.view(args.batch_size,-1))
+        for i, (x, y, idx) in enumerate(test_dataset):
+            hidden = model.init_hidden()
+            hidden_ = model.init_hidden()
+            '''Loss1: Free running loss'''
+            outVal = x[0]
+            outVals=[]
+            hids1 = []
+            for _ in range(x.size(0)):
+                outVal, hidden_, hid = model(outVal.unsqueeze(0), hidden_,return_hiddens=True)
+                outVals.append(outVal)
+                hids1.append(hid)
+            outSeq1 = torch.cat(outVals,dim=0)
+            hids1 = torch.cat(hids1,dim=0)
+            loss1 = criterion(outSeq1, y.view(-1))
 
-                '''Loss2: Teacher forcing loss'''
-                outSeq2, hidden, hids2 = model.forward(inputSeq, hidden, return_hiddens=True)
-                loss2 = criterion(outSeq2.view(args.batch_size, -1), targetSeq.view(args.batch_size, -1))
+            '''Loss2: Teacher forcing loss'''
+            outSeq2, hidden, hids2 = model(x, hidden, return_hiddens=True)
+            loss2 = criterion(outSeq2, y)
 
-                '''Loss3: Simplified Professor forcing loss'''
-                loss3 = criterion(hids1.view(args.batch_size,-1), hids2.view(args.batch_size,-1).detach())
+            '''Loss3: Simplified Professor forcing loss'''
+            loss3 = criterion(hids1.detach(), hids2.detach())
 
-                '''Total loss = Loss1+Loss2+Loss3'''
-                loss = loss1+loss2+loss3
+            '''Total loss = Loss1+Loss2+Loss3'''
+            loss = loss1+loss2+loss3
 
-                total_loss += loss.item()
+            total_loss += loss.item()
 
-    return total_loss / (nbatch+1)
+    return total_loss / (i+1)
 
 
 
-def main(args):
-    ###############################################################################
-    # Load data
-    ###############################################################################
 
-    train_dataset = TimeSeriesDataset(args.data, args.augment, args.noise_ratio)
-    test_dataset = TimeSeriesDataset(args.data, args.augment, args.noise_ratio, train = False, clean = False, trainset=train_dataset)
-    train_dataset_full = TimeSeriesDataset(args.data, args.augment, args.noise_ratio, train = True, clean = False, trainset=train_dataset)
+###############################################################################
+# Load data
+###############################################################################
 
+train_dataset = TimeSeriesDataset(args.data, args.augment, args.noise_ratio)
+test_dataset = TimeSeriesDataset(args.data, args.augment, args.noise_ratio, train = False, clean = False, trainset=train_dataset)
+train_dataset_full = TimeSeriesDataset(args.data, args.augment, args.noise_ratio, train = True, clean = False, trainset=train_dataset)
+Path('save',args.data,'checkpoint')
 
-    ###############################################################################
-    # Build the model
-    ###############################################################################
-    feature_dim = train_dataset[0][0].shape[1]
-    model = TimeSeriesLSTMStochastic(feature_dim, args.embed_dim, args.hidden_dim, args.nb_layers, args.dropout).to(args.device)
-    optimizer = optim.Adam(model.parameters(), lr= args.lr,weight_decay=args.weight_decay)
-    criterion = nn.MSELoss()
+###############################################################################
+# Build the model
+###############################################################################
+feature_dim = train_dataset[0][0].shape[1]
+model = TimeSeriesLSTMStochastic(feature_dim, args.embed_dim, args.hidden_dim, args.nb_layers, args.dropout).to(args.device)
+optimizer = optim.Adam(model.parameters(), lr= args.lr,weight_decay=args.weight_decay)
+criterion = nn.MSELoss()
 
-    # Loop over epochs.
+# Loop over epochs.
 if args.resume or args.pretrained:
     print("=> loading checkpoint ")
     checkpoint = torch.load(Path('save', args.data, 'checkpoint', args.filename).with_suffix('.pth'))
@@ -324,7 +321,7 @@ if not args.pretrained:
         print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.4f} | '.format(epoch, (time.time() - epoch_start_time),                                                                                        val_loss))
         print('-' * 89)
 
-        generate_output(args,epoch,model,gen_dataset,startPoint=1500)
+        #generate_output(args,epoch,model,gen_dataset,startPoint=1500)
 
         if epoch%args.save_interval==0:
             # Save the model if the validation loss is the best we've seen so far.
@@ -346,9 +343,8 @@ if not args.pretrained:
 # Calculate mean and covariance for each channel's prediction errors, and save them with the trained model
 print('=> calculating mean and covariance')
 means, covs = list(),list()
-train_dataset = TimeseriesData.batchify(args, TimeseriesData.trainData, bsz=1)
-for channel_idx in range(model.enc_input_size):
-    mean, cov = fit_norm_distribution_param(args,model,train_dataset[:TimeseriesData.length],channel_idx)
+for channel_idx in range(model.feature_dim):
+    mean, cov = fit_norm_distribution_param(args,model,train_dataset,channel_idx)
     means.append(mean), covs.append(cov)
 model_dictionary = {'epoch': max(epoch,start_epoch),
                     'best_loss': best_val_loss,
