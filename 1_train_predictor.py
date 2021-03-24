@@ -9,9 +9,11 @@ from matplotlib import pyplot as plt
 from pathlib import Path
 from anomalyDetector import fit_norm_distribution_param
 from dataloading import TimeSeriesDataset
+from tqdm import tqdm
+import pickle as pkl
 
 parser = argparse.ArgumentParser(description='PyTorch RNN Prediction Model on Time-series Dataset')
-parser.add_argument('--data', type=str, default='/mnt/d/vpell/Documents/Thèse/Python/data/3Tanks/capteurs_labels',
+parser.add_argument('--data', type=str, default='../../../workdir/pellegrainv/3Tanks/capteurs_labels',
                     help='type of the dataset (ecg, gesture, power_demand, space_shuttle, respiration, nyc_taxi')
 parser.add_argument('--filename', type=str, default='5 epochs',
                     help='filename of the dataset')
@@ -68,6 +70,8 @@ parser.add_argument('--pretrained','-p',
 parser.add_argument('--prediction_window_size', type=int, default=10,
                     help='prediction_window_size')
 args = parser.parse_args()
+#pkl.dump(args, open("args.pkl", "wb"))
+#exit()
 # Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
@@ -86,7 +90,7 @@ def generate_output(args,epoch, model, gen_dataset, disp_uncertainty=True,startP
     if args.save_fig:
         # Turn on evaluation mode which disables dropout.
         model.eval()
-        hidden = model.init_hidden(1)
+        hidden = model.init_hidden()
         outSeq = []
         upperlim95 = []
         lowerlim95 = []
@@ -175,7 +179,7 @@ def evaluate_1step_pred(args, model, test_dataset):
 
     return total_loss / nbatch
 
-def train(model, dataset, epoch):
+def train(args, model, dataset, epoch):
     epoch_loss1=[]
     epoch_loss2=[]
     epoch_loss3=[]
@@ -188,7 +192,7 @@ def train(model, dataset, epoch):
         total_loss = 0
         for e in range(epoch):
             epoch_loss = []
-            for i, (x, y, idx) in enumerate(dataset):
+            for i, (x, y, idx) in tqdm(enumerate(dataset)):
                 epoch_loss1.append(0)
                 epoch_loss2.append(0)
                 epoch_loss3.append(0)
@@ -199,10 +203,12 @@ def train(model, dataset, epoch):
                 outVal = x[0]
                 outVals=[]
                 hids1 = []
-                for _ in range(x.size(0)):
-                    outVal, hidden_, hid = model(outVal.unsqueeze(0), hidden_,return_hiddens=True)
+                for t in range(x.size(0)):
+                    outVal, hidden_, hid = model(outVal.unsqueeze(0).float(), hidden_,return_hiddens=True)
                     outVals.append(outVal)
                     hids1.append(hid)
+                    if(t<x.size(0)-1):
+                        outVal = torch.cat((outVal,x[t+1,4:]), axis = 0)
                 hids1 = torch.cat(hids1, dim=0)
                 outSeq1 = torch.cat(outVals,dim=0)
                 loss1 = criterion(outSeq1, y.view(-1))
@@ -244,17 +250,19 @@ def evaluate(args, model, test_dataset):
     model.eval()
     with torch.no_grad():
         total_loss = 0
-        for i, (x, y, idx) in enumerate(test_dataset):
+        for i, (x, y, idx) in tqdm(enumerate(test_dataset)):
             hidden = model.init_hidden()
             hidden_ = model.init_hidden()
             '''Loss1: Free running loss'''
             outVal = x[0]
             outVals=[]
             hids1 = []
-            for _ in range(x.size(0)):
+            for t in range(x.size(0)):
                 outVal, hidden_, hid = model(outVal.unsqueeze(0), hidden_,return_hiddens=True)
                 outVals.append(outVal)
                 hids1.append(hid)
+                if(t<x.size(0)-1):
+                    outVal = torch.cat((outVal,x[t+1,4:]), axis = 0)
             outSeq1 = torch.cat(outVals,dim=0)
             hids1 = torch.cat(hids1,dim=0)
             loss1 = criterion(outSeq1, y.view(-1))
@@ -280,26 +288,26 @@ def evaluate(args, model, test_dataset):
 # Load data
 ###############################################################################
 
-train_dataset = TimeSeriesDataset(args.data, args.augment, args.noise_ratio)
-test_dataset = TimeSeriesDataset(args.data, args.augment, args.noise_ratio, train = False, clean = False, trainset=train_dataset)
-train_dataset_full = TimeSeriesDataset(args.data, args.augment, args.noise_ratio, train = True, clean = False, trainset=train_dataset)
-Path('save',args.data,'checkpoint')
+train_dataset = TimeSeriesDataset(args.data, device = args.device)
+test_dataset = TimeSeriesDataset(args.data, train = False, clean = False, trainset=train_dataset, device = args.device)
+train_dataset_full = TimeSeriesDataset(args.data, train = True, clean = False, trainset=train_dataset, device = args.device)
 
 ###############################################################################
 # Build the model
 ###############################################################################
 feature_dim = train_dataset[0][0].shape[1]
-model = TimeSeriesLSTMStochastic(feature_dim, args.embed_dim, args.hidden_dim, args.nb_layers, args.dropout).to(args.device)
+out_dim = train_dataset[0][1].shape[1]
+model = TimeSeriesLSTMStochastic(args,feature_dim, args.embed_dim, args.hidden_dim, out_dim, args.nb_layers, args.dropout).to(args.device)
 optimizer = optim.Adam(model.parameters(), lr= args.lr,weight_decay=args.weight_decay)
 criterion = nn.MSELoss()
 
 # Loop over epochs.
 if args.resume or args.pretrained:
     print("=> loading checkpoint ")
-    checkpoint = torch.load(Path('save', args.data, 'checkpoint', args.filename).with_suffix('.pth'))
-    args, start_epoch, best_val_loss = model.load_checkpoint(args,checkpoint,feature_dim)
+    checkpoint = torch.load(Path('../../../workdir/pellegrainv/3Tanks/save').joinpath(args.filename).with_suffix('.pth'))
+    args, start_epoch, best_val_loss = model.load_checkpoint(args,checkpoint,feature_dim, out_dim)
     optimizer.load_state_dict((checkpoint['optimizer']))
-    del checkpoint
+    #del checkpoint
     epoch = start_epoch
     print("=> loaded checkpoint")
 else:
@@ -318,22 +326,21 @@ if not args.pretrained:
         train(args,model,train_dataset,args.epochs)
         val_loss = evaluate(args,model,test_dataset)
         print('-' * 89)
-        print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.4f} | '.format(epoch, (time.time() - epoch_start_time),                                                                                        val_loss))
+        #print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.4f} | '.format(epoch, (time.time() - epoch_start_time),                                                                                        val_loss))
         print('-' * 89)
 
         #generate_output(args,epoch,model,gen_dataset,startPoint=1500)
 
-        if epoch%args.save_interval==0:
-            # Save the model if the validation loss is the best we've seen so far.
-            is_best = val_loss < best_val_loss
-            best_val_loss = min(val_loss, best_val_loss)
-            model_dictionary = {'epoch': epoch,
-                                'best_loss': best_val_loss,
-                                'state_dict': model.state_dict(),
-                                'optimizer': optimizer.state_dict(),
-                                'args':args
-                                }
-            model.save_checkpoint(model_dictionary, is_best)
+        # Save the model if the validation loss is the best we've seen so far.
+        is_best = val_loss < best_val_loss
+        best_val_loss = min(val_loss, best_val_loss)
+        model_dictionary = {'epoch': args.epochs,
+                            'best_loss': best_val_loss,
+                            'state_dict': model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'args':args
+                            }
+        model.save_checkpoint(model_dictionary, is_best)
 
     except KeyboardInterrupt:
         print('-' * 89)
@@ -342,10 +349,7 @@ if not args.pretrained:
 
 # Calculate mean and covariance for each channel's prediction errors, and save them with the trained model
 print('=> calculating mean and covariance')
-means, covs = list(),list()
-for channel_idx in range(model.feature_dim):
-    mean, cov = fit_norm_distribution_param(args,model,train_dataset,channel_idx)
-    means.append(mean), covs.append(cov)
+means, covs = fit_norm_distribution_param(args,model,train_dataset)
 model_dictionary = {'epoch': max(epoch,start_epoch),
                     'best_loss': best_val_loss,
                     'state_dict': model.state_dict(),

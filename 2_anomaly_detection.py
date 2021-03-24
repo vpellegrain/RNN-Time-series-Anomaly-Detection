@@ -12,10 +12,13 @@ from sklearn.model_selection import GridSearchCV
 from anomalyDetector import fit_norm_distribution_param
 from anomalyDetector import anomalyScore
 from anomalyDetector import get_precision_recall
+from dataloading import TimeSeriesDataset
+from model.model import TimeSeriesLSTMStochastic
+
 parser = argparse.ArgumentParser(description='PyTorch RNN Anomaly Detection Model')
 parser.add_argument('--prediction_window_size', type=int, default=10,
                     help='prediction_window_size')
-parser.add_argument('--data', type=str, default='ecg',
+parser.add_argument('--data', type=str, default='../../../workdir/pellegrainv/3Tanks/capteurs_labels',
                     help='type of the dataset (ecg, gesture, power_demand, space_shuttle, respiration, nyc_taxi')
 parser.add_argument('--filename', type=str, default='chfdb_chf13_45590.pkl',
                     help='filename of the dataset')
@@ -30,7 +33,7 @@ parser.add_argument('--beta', type=float, default=1.0,
 args_ = parser.parse_args()
 print('-' * 89)
 print("=> loading checkpoint ")
-checkpoint = torch.load(str(Path('save',args_.data,'checkpoint',args_.filename).with_suffix('.pth')))
+checkpoint = torch.load(Path('../../../workdir/pellegrainv/3Tanks/save/5_epochs_visible').with_suffix('.pth'))
 args = checkpoint['args']
 args.prediction_window_size= args_.prediction_window_size
 args.beta = args_.beta
@@ -46,22 +49,16 @@ torch.cuda.manual_seed(args.seed)
 ###############################################################################
 # Load data
 ###############################################################################
-TimeseriesData = preprocess_data.PickleDataLoad(data_type=args.data,filename=args.filename, augment_test_data=False)
-train_dataset = TimeseriesData.batchify(args,TimeseriesData.trainData[:TimeseriesData.length], bsz=1)
-test_dataset = TimeseriesData.batchify(args,TimeseriesData.testData, bsz=1)
-
+train_dataset = TimeSeriesDataset(args.data, device = args.device)
+test_dataset = TimeSeriesDataset(args.data, train = False, clean = False, trainset=train_dataset, device = args.device)
+train_dataset_full = TimeSeriesDataset(args.data, train = True, clean = False, trainset=train_dataset, device = args.device)
 
 ###############################################################################
 # Build the model
 ###############################################################################
-nfeatures = TimeseriesData.trainData.size(-1)
-model = model.RNNPredictor(rnn_type = args.model,
-                           enc_inp_size=nfeatures,
-                           rnn_inp_size = args.emsize,
-                           rnn_hid_size = args.nhid,
-                           dec_out_size=nfeatures,
-                           nlayers = args.nlayers,
-                           res_connection=args.res_connection).to(args.device)
+nfeatures = train_dataset[0][0].shape[1]
+out_dim = train_dataset[0][1].shape[1]
+model = TimeSeriesLSTMStochastic(args,nfeatures, args.embed_dim, args.hidden_dim, out_dim, args.nb_layers, args.dropout).to(args.device)
 model.load_state_dict(checkpoint['state_dict'])
 #del checkpoint
 
@@ -69,12 +66,13 @@ scores, predicted_scores, precisions, recalls, f_betas = list(), list(), list(),
 targets, mean_predictions, oneStep_predictions, Nstep_predictions = list(), list(), list(), list()
 try:
     # For each channel in the dataset
-    for channel_idx in range(nfeatures):
+    for channel_idx in range(out_dim):
         ''' 1. Load mean and covariance if they are pre-calculated, if not calculate them. '''
         # Mean and covariance are calculated on train dataset.
         if 'means' in checkpoint.keys() and 'covs' in checkpoint.keys():
             print('=> loading pre-calculated mean and covariance')
-            mean, cov = checkpoint['means'][channel_idx], checkpoint['covs'][channel_idx]
+            mean, cov = checkpoint['means'][:,channel_idx], checkpoint['covs'][channel_idx]
+            #print(mean, cov)
         else:
             print('=> calculating mean and covariance')
             mean, cov = fit_norm_distribution_param(args, model, train_dataset, channel_idx=channel_idx)
@@ -86,11 +84,12 @@ try:
         if args.compensate:
             print('=> training an SVR as anomaly score predictor')
             train_score, _, _, hiddens, _ = anomalyScore(args, model, train_dataset, mean, cov, channel_idx=channel_idx)
-            score_predictor = GridSearchCV(SVR(), cv=5,param_grid={"C": [1e0, 1e1, 1e2],"gamma": np.logspace(-1, 1, 3)})
+            pickle.dump(train_score, open('train_score.p', "wb"))
+            pickle.dump(hiddens, open("hiddens.p","wb"))
+            score_predictor = GridSearchCV(SVR(), cv=5,param_grid={"C": [1e0, 1e1, 1e2],"gamma": np.logspace(-1, 1, 3)}, verbose = 10, n_jobs = 32)
             score_predictor.fit(torch.cat(hiddens,dim=0).numpy(), train_score.cpu().numpy())
         else:
             score_predictor=None
-
         ''' 3. Calculate anomaly scores'''
         # Anomaly scores are calculated on the test dataset
         # given the mean and the covariance calculated on the train dataset
@@ -98,14 +97,13 @@ try:
         score, sorted_prediction, sorted_error, _, predicted_score = anomalyScore(args, model, test_dataset, mean, cov,
                                                                                   score_predictor=score_predictor,
                                                                                   channel_idx=channel_idx)
-
         ''' 4. Evaluate the result '''
         # The obtained anomaly scores are evaluated by measuring precision, recall, and f_beta scores
         # The precision, recall, f_beta scores are are calculated repeatedly,
         # sampling the threshold from 1 to the maximum anomaly score value, either equidistantly or logarithmically.
         print('=> calculating precision, recall, and f_beta')
         precision, recall, f_beta = get_precision_recall(args, score, num_samples=1000, beta=args.beta,
-                                                         label=TimeseriesData.testLabel.to(args.device))
+                                                         label=test_dataset.labels.to(args.device))
         print('data: ',args.data,' filename: ',args.filename,
               ' f-beta (no compensation): ', f_beta.max().item(),' beta: ',args.beta)
         if args.compensate:
@@ -115,21 +113,23 @@ try:
             print('data: ',args.data,' filename: ',args.filename,
                   ' f-beta    (compensation): ', f_beta.max().item(),' beta: ',args.beta)
 
-
-        target = preprocess_data.reconstruct(test_dataset.cpu()[:, 0, channel_idx],
-                                             TimeseriesData.mean[channel_idx],
-                                             TimeseriesData.std[channel_idx]).numpy()
+        values = test_dataset[0][0][:,channel_idx]
+        for i in range(len(test_dataset))[1:]:
+            values = torch.cat((values, test_dataset[i][0][:,channel_idx]), 0)
+        target = preprocess_data.reconstruct(values.cpu(),
+                                             test_dataset.trainset.mean[channel_idx],
+                                             test_dataset.trainset.std[channel_idx]).numpy()
         mean_prediction = preprocess_data.reconstruct(sorted_prediction.mean(dim=1).cpu(),
-                                                      TimeseriesData.mean[channel_idx],
-                                                      TimeseriesData.std[channel_idx]).numpy()
+                                                      test_dataset.trainset.mean[channel_idx],
+                                                      test_dataset.trainset.std[channel_idx]).numpy()
         oneStep_prediction = preprocess_data.reconstruct(sorted_prediction[:, -1].cpu(),
-                                                         TimeseriesData.mean[channel_idx],
-                                                         TimeseriesData.std[channel_idx]).numpy()
+                                                         test_dataset.trainset.mean[channel_idx],
+                                                         test_dataset.trainset.std[channel_idx]).numpy()
         Nstep_prediction = preprocess_data.reconstruct(sorted_prediction[:, 0].cpu(),
-                                                       TimeseriesData.mean[channel_idx],
-                                                       TimeseriesData.std[channel_idx]).numpy()
+                                                       test_dataset.trainset.mean[channel_idx],
+                                                       test_dataset.trainset.std[channel_idx]).numpy()
         sorted_errors_mean = sorted_error.abs().mean(dim=1).cpu()
-        sorted_errors_mean *= TimeseriesData.std[channel_idx]
+        sorted_errors_mean *= test_dataset.trainset.std[channel_idx]
         sorted_errors_mean = sorted_errors_mean.numpy()
         score = score.cpu()
         scores.append(score), targets.append(target), predicted_scores.append(predicted_score)
@@ -139,7 +139,7 @@ try:
 
 
         if args.save_fig:
-            save_dir = Path('result',args.data,args.filename).with_suffix('').joinpath('fig_detection')
+            save_dir = Path('result')
             save_dir.mkdir(parents=True,exist_ok=True)
             plt.plot(precision.cpu().numpy(),label='precision')
             plt.plot(recall.cpu().numpy(),label='recall')
@@ -191,7 +191,7 @@ except KeyboardInterrupt:
 
 
 print('=> saving the results as pickle extensions')
-save_dir = Path('result', args.data, args.filename).with_suffix('')
+save_dir = Path('result')
 save_dir.mkdir(parents=True, exist_ok=True)
 pickle.dump(targets, open(str(save_dir.joinpath('target.pkl')),'wb'))
 pickle.dump(mean_predictions, open(str(save_dir.joinpath('mean_predictions.pkl')),'wb'))

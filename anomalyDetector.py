@@ -2,8 +2,9 @@ from torch.autograd import Variable
 import torch
 import numpy as np
 from tqdm import tqdm
+import itertools
 
-def fit_norm_distribution_param(args, model, train_dataset, channel_idx=0):
+def fit_norm_distribution_param(args, model, train_dataset):
     errors = []
     for i in tqdm(range(len(train_dataset))):
         sample = train_dataset[i][0]
@@ -16,81 +17,90 @@ def fit_norm_distribution_param(args, model, train_dataset, channel_idx=0):
             model.eval()
             pasthidden = model.init_hidden()
             for t in range(len(sample)):
+                up_bound = min(args.prediction_window_size, len(sample) - t)
                 out, hidden = model(sample[t].unsqueeze(0), pasthidden, False)
                 predictions.append([])
-                predictions[t].append(out.data.cpu()[channel_idx])
+                predictions[t].append(out.data.cpu())
                 pasthidden = model.repackage_hidden(hidden)
-                for _ in range(1,args.prediction_window_size):
+                for j in range(up_bound - 1):
+                    out = torch.cat((out,sample[t+j+1,4:]), axis = 0)
                     out, hidden = model(out.unsqueeze(0), hidden, False)
-                    predictions[t].append(out.data.cpu()[channel_idx])
+                    predictions[t].append(out.data.cpu())
 
                 if t >= args.prediction_window_size:
                     organized.append([])
                     errors.append([])
                     for step in range(args.prediction_window_size):
                         organized[-1].append(predictions[step+t-args.prediction_window_size][args.prediction_window_size-1-step])
-                    organized[-1]= torch.FloatTensor(organized[-1])
-                    errors[-1] = organized[-1] - sample[t][channel_idx]
+                    organized[-1]= torch.stack(organized[-1])
+                    errors[-1] = organized[-1] - sample[t,:4].data.cpu()
                     errors[-1] = errors[-1].unsqueeze(0)
 
     errors_tensor = torch.cat(errors, dim = 0)
     mean = errors_tensor.mean(dim=0)
-    cov = errors_tensor.t().mm(errors_tensor)/errors_tensor.size(0) - mean.unsqueeze(1).mm(mean.unsqueeze(0))
+    cov = []
+    for i in range(train_dataset[0][1].shape[1]):
+        cov.append(errors_tensor[:,:,i].t().mm(errors_tensor[:,:,i])/errors_tensor.size(0) - mean[:,i].unsqueeze(1).mm(mean[:,i].unsqueeze(0)))
 
     return mean, cov
 
 
-def anomalyScore(args, model, dataset, mean, cov, channel_idx=0, score_predictor=None):
+def anomalyScore(args, model, dataset, mean, cov, channel_idx = 0, score_predictor = None):
     scores = []
     hiddens = []
-    for t in tqdm(range(len(dataset))):
-        sample = trainset[t][0]
-        score_predictor = None
-        predictions = []
-        rearranged = []
-        errors = []
-        predicted_scores = []
-        sample = dataset[0][0]
+    predicted_scores = []
+    rearranged = []
+    errors = []
+    predictions = []
+    for i in tqdm(range(len(dataset))):
+        sample = dataset[i][0]
+        hiddens.append([])
+        predicted_scores.append([])
+        rearranged.append([])
+        errors.append([])
+        predictions.append([])
         with torch.no_grad():
             # Turn on evaluation mode which disables dropout.
             model.eval()
             pasthidden = model.init_hidden()
             for t in range(len(sample)):
+                up_bound = min(args.prediction_window_size, len(sample) - t)
                 out, hidden = model(sample[t].unsqueeze(0), pasthidden, False)
-                predictions.append([])
-                rearranged.append([])
-                errors.append([])
-                hiddens.append(hidden[0][-1].data.cpu())
+                predictions[i].append([])
+                rearranged[i].append([])
+                errors[i].append([])
+                hiddens[i].append(hidden[0][-1].data.cpu())
                 if score_predictor is not None:
                     predicted_scores.append(score_predictor.predict(hidden[0][-1].data.cpu().numpy()))
 
-                predictions[t].append(out.data.cpu()[channel_idx])
+                predictions[i][t].append(out.data.cpu()[channel_idx])
                 pasthidden = model.repackage_hidden(hidden)
-                for prediction_step in range(1, prediction_window_size):
+                for j in range(up_bound - 1):
+                    out = torch.cat((out,sample[t+j+1,4:]), axis = 0)
                     out, hidden = model(out.unsqueeze(0), hidden, False)
-                    predictions[t].append(out.data.cpu()[channel_idx])
+                    predictions[i][t].append(out.data.cpu()[channel_idx])
 
                 if t >= args.prediction_window_size:
                     for step in range(args.prediction_window_size):
-                        rearranged[t].append(
-                            predictions[step + t - args.prediction_window_size][args.prediction_window_size - 1 - step])
-                    rearranged[t] =torch.FloatTensor(rearranged[t]).unsqueeze(0)
-                    errors[t] = rearranged[t] - sample[t][channel_idx]
+                        rearranged[i][t].append(
+                            predictions[i][step + t - args.prediction_window_size][args.prediction_window_size - 1 - step])
+                    rearranged[i][t] =torch.FloatTensor(rearranged[i][t]).unsqueeze(0)
+                    errors[i][t] = rearranged[i][t] - sample[t][channel_idx].data.cpu()
                 else:
-                    rearranged[t] = torch.zeros(1,args.prediction_window_size)
-                    errors[t] = torch.zeros(1,args.prediction_window_size)
+                    rearranged[i][t] = torch.zeros(1,args.prediction_window_size)
+                    errors[i][t] = torch.zeros(1,args.prediction_window_size)
 
-        predicted_scores = np.array(predicted_scores)
-        for error in errors:
-            mult1 = error-mean[channel_idx].unsqueeze(0) # [ 1 * prediction_window_size ]
-            mult2 = torch.inverse(cov[channel_idx]) # [ prediction_window_size * prediction_window_size ]
+        predicted_scores[i] = np.array(predicted_scores[i])
+        for error in errors[i]:
+            mult1 = error-mean.unsqueeze(0) # [ 1 * prediction_window_size ]
+            mult2 = torch.inverse(cov) # [ prediction_window_size * prediction_window_size ]
             mult3 = mult1.t() # [ prediction_window_size * 1 ]
             score = torch.mm(mult1,torch.mm(mult2,mult3))
             scores.append(score[0][0])
 
     scores = torch.stack(scores)
-    rearranged = torch.cat(rearranged,dim=0)
-    errors = torch.cat(errors,dim=0)
+    rearranged = torch.cat(list(itertools.chain.from_iterable(rearranged)))
+    errors = torch.cat(list(itertools.chain.from_iterable(errors)))
     return scores, rearranged, errors, hiddens, predicted_scores
 
 def get_precision_recall(args, score, label, num_samples, beta=1.0, sampling='log', predicted_score=None):
@@ -107,6 +117,7 @@ def get_precision_recall(args, score, label, num_samples, beta=1.0, sampling='lo
         score = score - torch.FloatTensor(predicted_score).squeeze().to(args.device)
 
     maximum = score.max()
+    score = score.to(args.device)
     if sampling=='log':
         # Sample thresholds logarithmically
         # The sampled thresholds are logarithmically spaced between: math:`10 ^ {start}` and: math:`10 ^ {end}`.
