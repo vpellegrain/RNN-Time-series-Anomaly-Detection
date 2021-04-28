@@ -13,9 +13,9 @@ from tqdm import tqdm
 import pickle as pkl
 
 parser = argparse.ArgumentParser(description='PyTorch RNN Prediction Model on Time-series Dataset')
-parser.add_argument('--data', type=str, default='../../../workdir/pellegrainv/3Tanks/capteurs_labels',
+parser.add_argument('--data', type=str, default='../../../workdir/pellegrainv/3Tanks/capteurs_labels_visible',
                     help='type of the dataset (ecg, gesture, power_demand, space_shuttle, respiration, nyc_taxi')
-parser.add_argument('--filename', type=str, default='5 epochs',
+parser.add_argument('--filename', type=str, default='5epochs',
                     help='filename of the dataset')
 parser.add_argument('--model', type=str, default='LSTM',
                     help='type of recurrent net (RNN_TANH, RNN_RELU, LSTM, GRU, SRU)')
@@ -69,6 +69,8 @@ parser.add_argument('--pretrained','-p',
                     action="store_true")
 parser.add_argument('--prediction_window_size', type=int, default=10,
                     help='prediction_window_size')
+parser.add_argument('--man', action='store_true',
+                    help='données de manoeuvres')
 args = parser.parse_args()
 #pkl.dump(args, open("args.pkl", "wb"))
 #exit()
@@ -242,7 +244,7 @@ def train(args, model, dataset, epoch):
             epoch_loss1[-1]/=len(dataset)
             epoch_loss2[-1]/=len(dataset)
             epoch_loss3[-1]/=len(dataset)
-            print("EPOCH {:3d} : loss = {:5.4f} ,loss1 = {:5.4f} , loss2 = {:5.4f} , loss3 = {:5.4f} ".format(e, epoch_loss[-1], epoch_loss1[-1], epoch_loss2[-1], epoch_loss3[-1]))
+            print("EPOCH {:3d} : loss = {:5.4f} ,loss1 = {:5.8f} , loss2 = {:5.8f} , loss3 = {:5.8f} ".format(e, epoch_loss[-1], epoch_loss1[-1], epoch_loss2[-1], epoch_loss3[-1]))
     return epoch_loss,epoch_loss1,epoch_loss2,epoch_loss3
 
 def evaluate(args, model, test_dataset):
@@ -291,7 +293,6 @@ def evaluate(args, model, test_dataset):
 train_dataset = TimeSeriesDataset(args.data, device = args.device)
 test_dataset = TimeSeriesDataset(args.data, train = False, clean = False, trainset=train_dataset, device = args.device)
 train_dataset_full = TimeSeriesDataset(args.data, train = True, clean = False, trainset=train_dataset, device = args.device)
-
 ###############################################################################
 # Build the model
 ###############################################################################
@@ -326,7 +327,7 @@ if not args.pretrained:
         train(args,model,train_dataset,args.epochs)
         val_loss = evaluate(args,model,test_dataset)
         print('-' * 89)
-        #print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.4f} | '.format(epoch, (time.time() - epoch_start_time),                                                                                        val_loss))
+        #print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.8f} | '.format(epoch, (time.time() - epoch_start_time), val_loss))                                                                                       val_loss))
         print('-' * 89)
 
         #generate_output(args,epoch,model,gen_dataset,startPoint=1500)

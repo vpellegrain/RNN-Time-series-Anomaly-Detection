@@ -55,7 +55,7 @@ class TimeSeriesLSTMStochastic(nn.Module):
     def save_checkpoint(self,state, is_best):
         print("=> saving checkpoint ..")
         args = state['args']
-        checkpoint_dir = Path('../../../workdir/pellegrainv/3Tanks/save')
+        checkpoint_dir = Path('save/3tanks/checkpoint')
         checkpoint_dir.mkdir(parents=True,exist_ok=True)
         checkpoint = checkpoint_dir.joinpath(args.filename).with_suffix('.pth')
 

@@ -5,11 +5,12 @@ import numpy as np
 
 
 class TimeSeriesDataset(Dataset):
-    def __init__(self, dataset_dir ='../../../workdir/pellegrainv/3Tanks/capteurs_labels', augment = False, noise_ratio = 0.05, train = True, clean = True, trainset = None, device = 'cpu'):
+    def __init__(self, dataset_dir ='../../../workdir/pellegrainv/3Tanks/capteurs_labels_visible', augment = False, noise_ratio = 0.05, train = True, clean = True, trainset = None, device = 'cpu', man = False):
         self.train = train
         self.clean = clean
         self.trainset = trainset
         self.device = device
+        self.man = man
         if not train:
             dataset_dir = dataset_dir+'_test'
         self.data = pd.read_csv(dataset_dir+'.csv')
@@ -32,12 +33,19 @@ class TimeSeriesDataset(Dataset):
         for i in self.safe_sensors[1:]:
             self.labels = np.concatenate((self.labels, self.data[self.data["ID"] == i]["LABEL"].values[1:]), axis = 0)
         self.labels = torch.tensor(self.labels)
+        drop_list =  ['ID', 'LABEL', 'MAN_P1', 'MAN_P2', 'MAN_V1', 'MAN_V2', 'MAN_V3']
+        if man:
+            drop_list = ['ID', 'LABEL']
         for i in range(self.nb_safe_sensors):
-            self.X.append(torch.FloatTensor(self.data[self.data["ID"] == self.safe_sensors[i]].drop(['ID', 'LABEL'], axis = 1).values[:-1]))
+            self.X.append(torch.FloatTensor(self.data[self.data["ID"] == self.safe_sensors[i]].drop(drop_list, axis = 1).values[:-1]))
             self.y.append(torch.FloatTensor(self.data[self.data["ID"] == self.safe_sensors[i]].drop(['ID', 'LABEL', 'MAN_P1', 'MAN_P2', 'MAN_V1', 'MAN_V2', 'MAN_V3'], axis = 1).values[1:]))
             self.lengths.append(self.X[i].shape[0])
-        self.mean = torch.cat((torch.tensor(self.data.mean(axis = 0).drop(['ID', 'LABEL', 'MAN_P1', 'MAN_P2', 'MAN_V1', 'MAN_V2', 'MAN_V3'])), torch.zeros(5)), 0)
-        self.std = torch.cat((torch.tensor(self.data.std(axis = 0).drop(['ID', 'LABEL', 'MAN_P1', 'MAN_P2', 'MAN_V1', 'MAN_V2', 'MAN_V3'])), torch.ones(5)),0)
+        self.mean = torch.tensor(self.data.mean(axis = 0).drop(drop_list))
+        self.std = torch.tensor(self.data.std(axis = 0).drop(drop_list))
+        if man:
+            self.mean = torch.cat((self.mean, torch.zeros(5)), 0)
+            self.std = torch.cat((self.std, torch.ones(5)),0)
+        self.feature_dim = self.X[0].shape[1]
         
     def __len__(self):
         return len(self.lengths)
@@ -53,5 +61,5 @@ class TimeSeriesDataset(Dataset):
         else:
             retX = self.X[idx]
         if self.train and self.clean:
-            return (((retX - self.mean.expand_as(retX)) / self.std.expand_as(retX)).float().to(self.device), ((self.y[idx] - self.mean.expand_as(retX)[:,0:4]) / self.std.expand_as(retX)[:,0:4]).float().to(self.device), (torch.tensor(np.array(self.safe_sensors[idx]))).float().to(self.device)) 
-        return (((retX - self.trainset.mean.expand_as(retX)) / self.trainset.std.expand_as(retX)).float().to(self.device), ((self.y[idx] - self.trainset.mean.expand_as(retX)[:,0:4]) / self.trainset.std.expand_as(retX)[:,0:4]).float().to(self.device), torch.tensor(np.array(self.safe_sensors[idx])).float().to(self.device)) 
+            return (((retX - self.mean.expand_as(retX)) / self.std.expand_as(retX)).float().to(self.device), ((self.y[idx] - self.mean.expand_as(retX)[:,:4]) / self.std.expand_as(retX)[:,:4]).float().to(self.device), (torch.tensor(np.array(self.safe_sensors[idx]))).float().to(self.device)) 
+        return (((retX - self.trainset.mean.expand_as(retX)) / self.trainset.std.expand_as(retX)).float().to(self.device), ((self.y[idx] - self.trainset.mean.expand_as(retX)[:,:4]) / self.trainset.std.expand_as(retX)[:,:4]).float().to(self.device), torch.tensor(np.array(self.safe_sensors[idx])).float().to(self.device)) 
